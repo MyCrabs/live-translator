@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f172a">
+<title>Live Translator</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --text: #f1f5f9; --muted: #94a3b8;
+    --accent: #22c55e; --danger: #ef4444; --zh: #fde68a; --en: #f1f5f9;
+    --fs: 26px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans SC", sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 10px 12px; background: var(--panel); border-bottom: 1px solid #334155; }
+  header select, header button { font-size: 15px; padding: 8px 10px; border-radius: 10px;
+    border: 1px solid #475569; background: #0b1222; color: var(--text); }
+  header button { cursor: pointer; }
+  #startBtn { background: var(--accent); color: #052e16; font-weight: 700; border: none; min-width: 110px; }
+  #startBtn.on { background: var(--danger); color: #fff; }
+  .grow { flex: 1; }
+  #status { font-size: 13px; color: var(--muted); padding: 4px 12px; min-height: 22px; }
+  #status .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    background: #64748b; margin-right: 6px; vertical-align: middle; }
+  #status.live .dot { background: var(--danger); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  #log { flex: 1; overflow-y: auto; padding: 8px 14px 40px; scroll-behavior: smooth; }
+  .seg { padding: 10px 0; border-bottom: 1px solid #1e293b; }
+  .seg .zh { color: var(--zh); font-size: calc(var(--fs) * .72); line-height: 1.4; }
+  .seg .en { color: var(--en); font-size: var(--fs); line-height: 1.35; font-weight: 600; margin-top: 4px; }
+  .seg.interim .zh, .seg.interim .en { opacity: .6; font-style: italic; }
+  .seg .en.pending { color: var(--muted); font-weight: 400; }
+  body.hide-zh .seg .zh { display: none; }
+  #empty { color: var(--muted); text-align: center; margin-top: 18vh; padding: 0 20px; font-size: 17px; line-height: 1.6; }
+  #warn { display: none; background: #7f1d1d; color: #fff; padding: 10px 12px; font-size: 14px; }
+  label.chk { font-size: 14px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+</style>
+</head>
+<body>
+<div id="warn"></div>
+<header>
+  <button id="startBtn">▶ Bắt đầu</button>
+  <select id="srcLang" title="Ngôn ngữ người nói">
+    <option value="cmn-Hans-CN">🇨🇳 Trung (Phổ thông)</option>
+    <option value="cmn-Hant-TW">🇹🇼 Trung (Đài Loan)</option>
+    <option value="yue-Hant-HK">🇭🇰 Quảng Đông</option>
+    <option value="en-US">🇺🇸 English</option>
+    <option value="vi-VN">🇻🇳 Tiếng Việt</option>
+  </select>
+  <span>→</span>
+  <select id="tgtLang" title="Dịch sang">
+    <option value="en">English</option>
+    <option value="vi">Tiếng Việt</option>
+    <option value="zh-CN">中文</option>
+  </select>
+  <span class="grow"></span>
+  <label class="chk"><input type="checkbox" id="showZh" checked> Hiện gốc</label>
+  <button id="smaller" title="Chữ nhỏ hơn">A−</button>
+  <button id="bigger" title="Chữ to hơn">A+</button>
+  <button id="copyBtn" title="Sao chép toàn bộ">📋</button>
+  <button id="clearBtn" title="Xoá">🗑</button>
+</header>
+<div id="status"><span class="dot"></span><span id="statusText">Sẵn sàng</span></div>
+<main id="log">
+  <div id="empty">Bấm <b>▶ Bắt đầu</b>, cho phép micro, rồi đặt điện thoại gần người nói.<br>
+  Câu tiếng Trung sẽ hiện màu vàng, bản dịch hiện chữ to bên dưới.</div>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const log = $('log'), startBtn = $('startBtn'), statusEl = $('status'), statusText = $('statusText');
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  // ---------- settings ----------
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem('lt_' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem('lt_' + k, JSON.stringify(v)); } catch {} }
+  };
+  let fs = store.get('fs', 26);
+  const applyFs = () => { document.documentElement.style.setProperty('--fs', fs + 'px'); store.set('fs', fs); };
+  applyFs();
+  $('bigger').onclick = () => { fs = Math.min(64, fs + 3); applyFs(); };
+  $('smaller').onclick = () => { fs = Math.max(14, fs - 3); applyFs(); };
+  $('srcLang').value = store.get('src', 'cmn-Hans-CN');
+  $('tgtLang').value = store.get('tgt', 'en');
+  $('showZh').checked = store.get('showZh', true);
+  const applyZh = () => document.body.classList.toggle('hide-zh', !$('showZh').checked);
+  applyZh();
+  $('showZh').onchange = () => { store.set('showZh', $('showZh').checked); applyZh(); };
+  $('tgtLang').onchange = () => store.set('tgt', $('tgtLang').value);
+  // Changing language while running: abort the current session; onend recreates it with the new lang.
+  $('srcLang').onchange = () => { store.set('src', $('srcLang').value); if (running && rec) { try { rec.abort(); } catch {} } };
+
+  const warns = [];
+  if (!SR) {
+    warns.push('Trình duyệt này không hỗ trợ nhận giọng nói. Hãy mở bằng Google Chrome (Android hoặc máy tính) hoặc Microsoft Edge.');
+    startBtn.disabled = true;
+  }
+  if (!window.isSecureContext) warns.push('Cần mở trang qua https:// (hoặc localhost) thì micro mới hoạt động.');
+  if (warns.length) { $('warn').style.display = 'block'; $('warn').textContent = warns.join(' '); }
+
+  // ---------- translation (free endpoints, with fallback + cache) ----------
+  const cache = new Map();
+  const srcCode = () => { const v = $('srcLang').value;
+    return v.startsWith('cmn-Hant') ? 'zh-TW' : v.startsWith('cmn') ? 'zh-CN' : v.startsWith('yue') ? 'zh-TW' : v.split('-')[0]; };
+
+  async function withTimeout(p, ms) {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms);
+    try { return await p(ctl.signal); } finally { clearTimeout(t); }
+  }
+  async function googleGtx(text, sl, tl) {
+    const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=' +
+      encodeURIComponent(sl) + '&tl=' + encodeURIComponent(tl) + '&q=' + encodeURIComponent(text);
+    return withTimeout(async signal => {
+      const r = await fetch(url, { signal }); if (!r.ok) throw new Error('gtx ' + r.status);
+      const j = await r.json(); return j[0].map(x => x[0]).join('');
+    }, 4000);
+  }
+  async function myMemory(text, sl, tl) {
+    const url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) +
+      '&langpair=' + encodeURIComponent(sl + '|' + tl);
+    return withTimeout(async signal => {
+      const r = await fetch(url, { signal }); if (!r.ok) throw new Error('mm ' + r.status);
+      const j = await r.json(); if (j.responseStatus != 200) throw new Error('mm ' + j.responseStatus);
+      return j.responseData.translatedText;
+    }, 6000);
+  }
+  // If Google fails (e.g. rate limit), back off for a while. During back-off, interim (live) text is
+  // not translated, so the small MyMemory daily quota is spent only on final sentences.
+  let gtxBlockedUntil = 0;
+  async function translate(text, isInterim) {
+    const sl = srcCode(), tl = $('tgtLang').value;
+    if (sl.split('-')[0] === tl.split('-')[0]) return text;
+    const key = sl + '|' + tl + '|' + text;
+    if (cache.has(key)) return cache.get(key);
+    let out;
+    if (Date.now() >= gtxBlockedUntil) {
+      try { out = await googleGtx(text, sl, tl); }
+      catch (e) { console.warn(e); gtxBlockedUntil = Date.now() + 20000; }
+    }
+    if (out === undefined) {
+      if (isInterim) throw new Error('skip interim during back-off');
+      out = await myMemory(text, sl, tl);
+    }
+    if (cache.size > 500) cache.delete(cache.keys().next().value);
+    cache.set(key, out);
+    return out;
+  }
+
+  // ---------- UI segments ----------
+  let interimEl = null, userScrolledUp = false;
+  let lastInterimTr = 0, interimTimer = null, interimSeq = 0;
+  log.addEventListener('scroll', () => {
+    userScrolledUp = log.scrollHeight - log.scrollTop - log.clientHeight > 80;
+  });
+  const scrollDown = () => { if (!userScrolledUp) log.scrollTop = log.scrollHeight; };
+  function makeSeg(cls) {
+    $('empty')?.remove();
+    const d = document.createElement('div'); d.className = 'seg ' + (cls || '');
+    d.innerHTML = '<div class="zh"></div><div class="en pending"></div>';
+    log.appendChild(d); return d;
+  }
+
+  // final segment: translate immediately
+  async function addFinal(text) {
+    // cancel any pending/in-flight interim translation so it can't land on the next segment
+    clearTimeout(interimTimer); interimTimer = null; interimSeq++;
+    text = text.trim();
+    if (!text) { if (interimEl) { interimEl.remove(); interimEl = null; } return; }
+    let seg;
+    if (interimEl) { seg = interimEl; interimEl = null; seg.classList.remove('interim'); }
+    else seg = makeSeg();
+    seg.querySelector('.zh').textContent = text;
+    const en = seg.querySelector('.en');
+    if (!seg.dataset.tr) { en.textContent = '…'; en.classList.add('pending'); }
+    scrollDown();
+    try {
+      const t = await translate(text);
+      en.textContent = t; en.classList.remove('pending');
+    } catch (e) {
+      en.textContent = '[Lỗi dịch – kiểm tra mạng]'; console.error(e);
+    }
+    scrollDown();
+  }
+
+  // interim: show live, translate at most every ~400ms
+  const INTERIM_MS = 400;
+  function showInterim(text) {
+    text = text.trim(); if (!text) return;
+    if (!interimEl) interimEl = makeSeg('interim');
+    interimEl.querySelector('.zh').textContent = text;
+    scrollDown();
+    const run = async () => {
+      interimTimer = null; lastInterimTr = Date.now();
+      const my = ++interimSeq, el = interimEl;
+      try {
+        const t = await translate(text, true);
+        if (el && el === interimEl && my === interimSeq) {
+          const en = el.querySelector('.en'); en.textContent = t; en.classList.remove('pending'); el.dataset.tr = 1; scrollDown();
+        }
+      } catch {}
+    };
+    clearTimeout(interimTimer);
+    const wait = Math.max(0, INTERIM_MS - (Date.now() - lastInterimTr));
+    interimTimer = setTimeout(run, wait);
+  }
+
+  // ---------- speech recognition ----------
+  let rec = null, running = false, wakeLock = null, restartCount = 0, restartTimer = null;
+  function setStatus(t, live) { statusText.textContent = t; statusEl.classList.toggle('live', !!live); }
+
+  const FATAL = {
+    'not-allowed': 'Chưa được phép dùng micro. Hãy cho phép micro (biểu tượng ổ khoá trên thanh địa chỉ) rồi bấm Bắt đầu lại.',
+    'service-not-allowed': 'Trình duyệt chặn dịch vụ nhận giọng nói. Hãy dùng Google Chrome.',
+    'audio-capture': 'Không tìm thấy micro. Kiểm tra micro rồi bấm Bắt đầu lại.',
+    'language-not-supported': 'Trình duyệt không hỗ trợ ngôn ngữ này.'
+  };
+
+  // A fresh recognizer per session: picks up language changes, and events from an old
+  // (stopped/aborted) instance are ignored via the `r !== rec` checks.
+  function createRec() {
+    const r = new SR();
+    let errored = false;
+    r.lang = $('srcLang').value;
+    r.continuous = true;
+    r.interimResults = true;
+    r.maxAlternatives = 1;
+    r.onstart = () => { if (r === rec) setStatus('Đang nghe…', true); };
+    r.onresult = ev => {
+      let interim = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const res = ev.results[i];
+        if (res.isFinal) addFinal(res[0].transcript);
+        else interim += res[0].transcript;
+      }
+      if (interim) showInterim(interim);
+    };
+    r.onerror = e => {
+      if (r !== rec) return;
+      if (FATAL[e.error]) { stop(); setStatus(FATAL[e.error]); }
+      else if (e.error !== 'no-speech' && e.error !== 'aborted') {
+        errored = true; setStatus('Lỗi: ' + e.error + ' – đang thử lại…');
+      }
+    };
+    r.onend = () => {
+      if (r !== rec) return;
+      // finalize whatever was still interim when the session ended
+      if (interimEl) addFinal(interimEl.querySelector('.zh').textContent);
+      // Chrome (esp. Android) ends sessions often; restart right away to keep it continuous.
+      // Back off only when sessions keep failing with real errors (e.g. no network).
+      if (running) { restartCount = errored ? restartCount + 1 : 0; scheduleRestart(); }
+    };
+    return r;
+  }
+  function scheduleRestart() {
+    clearTimeout(restartTimer);
+    restartTimer = setTimeout(launch, restartCount ? Math.min(5000, 500 * restartCount) : 50);
+  }
+  function launch() {
+    if (!running) return;
+    rec = createRec();
+    try { rec.start(); } catch (e) { console.warn(e); restartCount++; scheduleRestart(); }
+  }
+
+  async function start() {
+    if (!SR) return;
+    if (rec) { const old = rec; rec = null; try { old.abort(); } catch {} }
+    running = true; restartCount = 0;
+    startBtn.textContent = '■ Dừng'; startBtn.classList.add('on');
+    setStatus('Đang khởi động…');
+    launch();
+    try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+  }
+  function stop() {
+    running = false;
+    clearTimeout(restartTimer);
+    startBtn.textContent = '▶ Bắt đầu'; startBtn.classList.remove('on');
+    try { rec && rec.stop(); } catch {}   // stop() (not abort) so the last sentence is still delivered
+    try { wakeLock && wakeLock.release(); } catch {} wakeLock = null;
+    setStatus('Đã dừng');
+  }
+  startBtn.onclick = () => running ? stop() : start();
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible' && running && 'wakeLock' in navigator) {
+      try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+    }
+  });
+
+  // ---------- tools ----------
+  $('clearBtn').onclick = () => {
+    if (running) stop();
+    clearTimeout(interimTimer); interimSeq++;
+    log.innerHTML = ''; interimEl = null;
+  };
+  $('copyBtn').onclick = async () => {
+    const txt = [...log.querySelectorAll('.seg')].map(s =>
+      s.querySelector('.zh').textContent + '\n' + s.querySelector('.en').textContent).join('\n\n');
+    try { await navigator.clipboard.writeText(txt); setStatus('Đã sao chép', running); } catch { setStatus('Không sao chép được', running); }
+  };
+})();
+</script>
+</body>
+</html>
