@@ -2,7 +2,7 @@
 
 Ứng dụng web miễn phí: đặt điện thoại/laptop cạnh người nói tiếng Trung (Phổ thông), ứng dụng nghe và hiện bản dịch tiếng Anh ngay lập tức. Không cần cài đặt, không cần tài khoản, không có máy chủ riêng.
 
-**Mở ứng dụng:** https://YOUR-USERNAME.github.io/live-translator/
+**Mở ứng dụng:** https://mycrabs.github.io/live-translator/
 
 ## Cách dùng
 
