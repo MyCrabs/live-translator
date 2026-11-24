@@ -24,7 +24,10 @@
   #startBtn { background: var(--accent); color: #052e16; font-weight: 700; border: none; min-width: 110px; }
   #startBtn.on { background: var(--danger); color: #fff; }
   .grow { flex: 1; }
-  #status { font-size: 13px; color: var(--muted); padding: 4px 12px; min-height: 22px; }
+  #status { font-size: 13px; color: var(--muted); padding: 4px 12px; min-height: 22px; display: flex; gap: 6px; align-items: center; }
+  #status #statusText { flex: 1; }
+  #engine { font-size: 12px; opacity: .8; white-space: nowrap; }
+  body.no-tab #source, body.no-tab .tabhint { display: none; }
   #status .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
     background: #64748b; margin-right: 6px; vertical-align: middle; }
   #status.live .dot { background: var(--danger); animation: pulse 1s infinite; }
@@ -45,6 +48,10 @@
 <div id="warn"></div>
 <header>
   <button id="startBtn">▶ Bắt đầu</button>
+  <select id="source" title="Nghe từ đâu">
+    <option value="mic">🎤 Micro</option>
+    <option value="tab">🖥 Âm thanh tab</option>
+  </select>
   <select id="srcLang" title="Ngôn ngữ người nói">
     <option value="cmn-Hans-CN">🇨🇳 Trung (Phổ thông)</option>
     <option value="cmn-Hant-TW">🇹🇼 Trung (Đài Loan)</option>
@@ -65,10 +72,12 @@
   <button id="copyBtn" title="Sao chép toàn bộ">📋</button>
   <button id="clearBtn" title="Xoá">🗑</button>
 </header>
-<div id="status"><span class="dot"></span><span id="statusText">Sẵn sàng</span></div>
+<div id="status"><span class="dot"></span><span id="statusText">Sẵn sàng</span><span id="engine"></span></div>
 <main id="log">
   <div id="empty">Bấm <b>▶ Bắt đầu</b>, cho phép micro, rồi đặt điện thoại gần người nói.<br>
-  Câu tiếng Trung sẽ hiện màu vàng, bản dịch hiện chữ to bên dưới.</div>
+  Câu tiếng Trung sẽ hiện màu vàng, bản dịch hiện chữ to bên dưới.
+  <span class="tabhint"><br><br>Muốn dịch video/cuộc gọi đang phát trên máy tính này? Chọn <b>🖥 Âm thanh tab</b>,
+  bấm Bắt đầu, chọn tab đó và bật <b>“Chia sẻ cả âm thanh của thẻ”</b>.</span></div>
 </main>
 
 <script>
@@ -93,9 +102,17 @@
   const applyZh = () => document.body.classList.toggle('hide-zh', !$('showZh').checked);
   applyZh();
   $('showZh').onchange = () => { store.set('showZh', $('showZh').checked); applyZh(); };
-  $('tgtLang').onchange = () => store.set('tgt', $('tgtLang').value);
+  $('tgtLang').onchange = () => { store.set('tgt', $('tgtLang').value); prepareLocal(); updateEngine(); };
   // Changing language while running: abort the current session; onend recreates it with the new lang.
-  $('srcLang').onchange = () => { store.set('src', $('srcLang').value); if (running && rec) { try { rec.abort(); } catch {} } };
+  $('srcLang').onchange = () => {
+    store.set('src', $('srcLang').value); prepareLocal(); updateEngine();
+    if (running && rec) { try { rec.abort(); } catch {} }
+  };
+  // Tab-audio capture needs getDisplayMedia (desktop Chrome/Edge only).
+  const canTab = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+  document.body.classList.toggle('no-tab', !canTab);
+  $('source').value = canTab ? store.get('source', 'mic') : 'mic';
+  $('source').onchange = () => { store.set('source', $('source').value); if (running) { stop(); start(); } };
 
   const warns = [];
   if (!SR) {
@@ -117,13 +134,14 @@
     const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms);
     try { return await p(ctl.signal); } finally { clearTimeout(t); }
   }
-  async function googleGtx(text, sl, tl) {
+  async function googleGtx(text, sl, tl, ms = 4000) {
     const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=' +
       encodeURIComponent(sl) + '&tl=' + encodeURIComponent(tl) + '&q=' + encodeURIComponent(text);
     return withTimeout(async signal => {
-      const r = await fetch(url, { signal }); if (!r.ok) throw new Error('gtx ' + r.status);
+      const r = await fetch(url, { signal });
+      if (!r.ok) { const e = new Error('gtx ' + r.status); e.status = r.status; throw e; }
       const j = await r.json(); return j[0].map(x => x[0]).join('');
-    }, 4000);
+    }, ms);
   }
   async function myMemory(text, sl, tl) {
     const url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) +
@@ -134,23 +152,70 @@
       return j.responseData.translatedText;
     }, 6000);
   }
-  // If Google fails (e.g. rate limit), back off for a while. During back-off, interim (live) text is
-  // not translated, so the small MyMemory daily quota is spent only on final sentences.
-  let gtxBlockedUntil = 0;
+  // Chrome's built-in on-device Translator (desktop Chrome 138+): free, no quota, works offline once
+  // the language model is downloaded. Creating it may download the model, which needs a user gesture,
+  // so prepareLocal() is called from click/change handlers. Used as the fallback when Google fails.
+  const localTr = new Map();   // 'zh|en' -> { tr: Translator|null, state: 'loading'|'ready'|'failed', pct }
+  const toLocal = c => c === 'zh-CN' ? 'zh' : c === 'zh-TW' ? 'zh-Hant' : c;
+  const localKey = () => toLocal(srcCode()) + '|' + toLocal($('tgtLang').value);
+  function prepareLocal() {
+    if (!('Translator' in self)) return;
+    const sl = toLocal(srcCode()), tl = toLocal($('tgtLang').value), key = sl + '|' + tl;
+    if (sl.split('-')[0] === tl.split('-')[0]) return;
+    const cur = localTr.get(key);
+    if (cur && cur.state !== 'failed') return;
+    const entry = { tr: null, state: 'loading', pct: 0 };
+    localTr.set(key, entry); updateEngine();
+    Translator.create({
+      sourceLanguage: sl, targetLanguage: tl,
+      monitor(m) { m.addEventListener('downloadprogress', e => { entry.pct = Math.round(e.loaded * 100); updateEngine(); }); }
+    }).then(tr => { entry.tr = tr; entry.state = 'ready'; updateEngine(); })
+      .catch(e => { console.warn('Local translator unavailable:', e); entry.state = 'failed'; updateEngine(); });
+  }
+  const localReady = () => { const e = localTr.get(localKey()); return e && e.state === 'ready' ? e.tr : null; };
+
+  // Status-bar note: which engine translated the last sentence, and whether the on-device fallback is ready.
+  let lastEngine = '';
+  function updateEngine() {
+    const e = localTr.get(localKey());
+    const fb = !e ? '' : e.state === 'ready' ? ' · dự phòng trên máy ✓'
+      : e.state === 'loading' ? ' · đang tải dự phòng' + (e.pct ? ' ' + e.pct + '%' : '…') : '';
+    $('engine').textContent = (lastEngine ? 'Dịch: ' + lastEngine : '') + fb;
+  }
+
+  // Final sentences: Google (best quality) → Chrome on-device → MyMemory (small daily quota).
+  // Live/interim text: Chrome on-device first when ready (instant, unlimited; it's replaced by the
+  // final translation anyway), which also keeps the request rate to Google low → fewer rate limits.
+  // A one-off Google error only sends that sentence to the fallback. Google is paused for 20s
+  // (instead of being hammered) only on a rate limit (429) or 2 failures in a row.
+  let gtxBlockedUntil = 0, gtxFails = 0;
   async function translate(text, isInterim) {
     const sl = srcCode(), tl = $('tgtLang').value;
     if (sl.split('-')[0] === tl.split('-')[0]) return text;
     const key = sl + '|' + tl + '|' + text;
     if (cache.has(key)) return cache.get(key);
-    let out;
+    let out, engine;
+    if (isInterim && localReady()) {
+      try { return await localReady().translate(text); } catch (e) { console.warn(e); }
+    }
     if (Date.now() >= gtxBlockedUntil) {
-      try { out = await googleGtx(text, sl, tl); }
-      catch (e) { console.warn(e); gtxBlockedUntil = Date.now() + 20000; }
+      try { out = await googleGtx(text, sl, tl, isInterim ? 2500 : 4000); engine = 'Google'; gtxFails = 0; }
+      catch (e) {
+        console.warn(e);
+        if (e.status === 429 || ++gtxFails >= 2) { gtxBlockedUntil = Date.now() + 20000; gtxFails = 0; }
+        // the on-device fallback may have failed to start earlier: retry (works without a gesture once downloaded)
+        const le = localTr.get(localKey()); if (le && le.state === 'failed') prepareLocal();
+      }
+    }
+    const lt = out === undefined && localReady();
+    if (lt) {
+      try { out = await lt.translate(text); engine = 'Chrome (trên máy)'; } catch (e) { console.warn(e); }
     }
     if (out === undefined) {
-      if (isInterim) throw new Error('skip interim during back-off');
-      out = await myMemory(text, sl, tl);
+      if (isInterim) throw new Error('skip interim: no quota-free engine available');
+      out = await myMemory(text, sl, tl); engine = 'MyMemory';
     }
+    if (engine !== lastEngine) { lastEngine = engine; updateEngine(); }
     if (cache.size > 500) cache.delete(cache.keys().next().value);
     cache.set(key, out);
     return out;
@@ -192,26 +257,92 @@
     scrollDown();
   }
 
+  // ---------- long-utterance splitting ----------
+  // Fast or non-stop speakers can keep Chrome in one ever-growing interim result for a long time:
+  // a huge block on screen that gets re-translated in full every update. We commit the stable head of
+  // the interim as its own sentence and keep showing only the rest. `committed` counts how many chars
+  // of the current utterance were already split off, so the later final result isn't shown twice.
+  let committed = 0;
+  const isCJK = () => /^(cmn|yue)/.test($('srcLang').value);
+  // group 1: sentence-final particles (cut after them); otherwise: connectives and common sentence
+  // starters (cut before them). Imperfect, but far better than splitting a word in half.
+  // Connectives are the more reliable boundary, so they win over sentence starters.
+  const CJK_BREAKS = [
+    /([吗呢吧嘛啦])(?=[^\s])|然后|但是|可是|所以|因为|而且|如果|最后|不过|另外|接着|同时|还有|那么|首先|其次|于是|因此|并且|虽然|其实/g,
+    /我觉得|我认为|我想|我们|你们|他们|大家|很多|现在|今天|明天|昨天|这个|那个/g
+  ];
+  function splitLong(full) {
+    const cjk = isCJK();
+    const MIN = cjk ? 8 : 40,     // don't commit tiny fragments
+          MAX = cjk ? 30 : 160,   // force a cut past this length even without punctuation
+          TAIL = cjk ? 6 : 30;    // newest chars are still being revised by the recognizer: never commit them
+    let rest = full.slice(committed);
+    for (;;) {
+      const stable = rest.length - TAIL;
+      if (stable < MIN) break;
+      // Prefer the last sentence end within the stable part, then a comma, else a hard cut when too long.
+      let cut = -1;
+      for (const re of [/[。！？!?；;]|\.(?=\s)/g, /[，,、：:]/g]) {
+        for (const m of rest.slice(0, stable).matchAll(re)) if (m.index + 1 >= MIN) cut = m.index + 1;
+        if (cut > 0) break;
+      }
+      if (cut > 0 && cut < MIN * 2 && rest.length <= MAX) {
+        // only a comma-level cut early on: wait for more context unless it's a full sentence end
+        if (!/[。！？!?；;.]/.test(rest[cut - 1])) cut = -1;
+      }
+      if (cut < 0) {
+        if (rest.length <= MAX) break;
+        cut = stable;
+        if (cjk) {
+          // No punctuation (typical for Chrome's Mandarin): cut before a connective word, or after a
+          // question/sentence particle, so we don't split mid-word (e.g. "分析一|下").
+          const head = rest.slice(0, stable);
+          for (const re of CJK_BREAKS) {
+            let best = -1;
+            for (const m of head.matchAll(re)) {
+              const at = m[1] ? m.index + m[1].length : m.index;   // after particle | before the word
+              if (at >= MIN) best = at;
+            }
+            if (best > 0) { cut = best; break; }
+          }
+        } else { const sp = rest.lastIndexOf(' ', stable); if (sp >= MIN) cut = sp; }
+      }
+      addFinal(rest.slice(0, cut));
+      committed += cut; rest = rest.slice(cut);
+    }
+    return rest;
+  }
+
   // interim: show live, translate at most every ~400ms
   const INTERIM_MS = 400;
+  // At most one interim request in flight: when the service is slow, requests must not pile up.
+  // Whatever text is newest when the slot frees up gets translated next.
+  let interimBusy = false, interimText = '';
+  const scheduleInterim = () => {
+    if (interimBusy || interimTimer) return;
+    interimTimer = setTimeout(runInterim, Math.max(0, INTERIM_MS - (Date.now() - lastInterimTr)));
+  };
   function showInterim(text) {
     text = text.trim(); if (!text) return;
     if (!interimEl) interimEl = makeSeg('interim');
     interimEl.querySelector('.zh').textContent = text;
+    interimText = text;
     scrollDown();
-    const run = async () => {
-      interimTimer = null; lastInterimTr = Date.now();
-      const my = ++interimSeq, el = interimEl;
-      try {
-        const t = await translate(text, true);
-        if (el && el === interimEl && my === interimSeq) {
-          const en = el.querySelector('.en'); en.textContent = t; en.classList.remove('pending'); el.dataset.tr = 1; scrollDown();
-        }
-      } catch {}
-    };
-    clearTimeout(interimTimer);
-    const wait = Math.max(0, INTERIM_MS - (Date.now() - lastInterimTr));
-    interimTimer = setTimeout(run, wait);
+    scheduleInterim();
+  }
+  async function runInterim() {
+    interimTimer = null;
+    if (!interimEl) return;
+    interimBusy = true; lastInterimTr = Date.now();
+    const my = ++interimSeq, el = interimEl, text = interimText;
+    try {
+      const t = await translate(text, true);
+      if (el === interimEl && my === interimSeq) {
+        const en = el.querySelector('.en'); en.textContent = t; en.classList.remove('pending'); el.dataset.tr = 1; scrollDown();
+      }
+    } catch {}
+    interimBusy = false;
+    if (interimEl && interimText !== text) scheduleInterim();
   }
 
   // ---------- speech recognition ----------
@@ -239,11 +370,15 @@
       networkFails = 0;
       let interim = '';
       for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const res = ev.results[i];
-        if (res.isFinal) addFinal(res[0].transcript);
-        else interim += res[0].transcript;
+        const res = ev.results[i], t = res[0].transcript;
+        if (res.isFinal) {
+          // drop the part already shown as split-off sentences
+          const skip = Math.min(committed, t.length); committed -= skip;
+          addFinal(t.slice(skip));
+        } else interim += t;
       }
-      if (interim) showInterim(interim);
+      if (interim) showInterim(splitLong(interim));
+      else committed = 0;   // utterance fully finalized
     };
     r.onerror = e => {
       if (r !== rec) return;
@@ -275,12 +410,68 @@
   }
   function launch() {
     if (!running) return;
-    rec = createRec();
-    try { rec.start(); } catch (e) { console.warn(e); restartCount++; scheduleRestart(); }
+    rec = createRec(); committed = 0;
+    try { audioTrack ? rec.start(audioTrack) : rec.start(); }
+    catch (e) { console.warn(e); restartCount++; scheduleRestart(); }
   }
 
+  // ---------- tab-audio source ----------
+  // Chrome 133+ lets SpeechRecognition.start() take a MediaStreamTrack instead of the mic. We capture a
+  // tab's audio with getDisplayMedia — this also avoids the mic's echo cancellation, which erases sound
+  // played by this same computer (why a YouTube video on the laptop speaker wasn't recognized).
+  let tabStream = null, audioTrack = null, trackSupport;
+  function supportsTrackInput() {
+    // Older browsers silently ignore the argument and would use the mic instead. Feature-test by passing
+    // an already-ended track: a browser that understands the argument rejects it with InvalidStateError.
+    if (trackSupport !== undefined) return trackSupport;
+    trackSupport = false;
+    try {
+      const ctx = new AudioContext();
+      const t = ctx.createMediaStreamDestination().stream.getAudioTracks()[0];
+      t.stop(); ctx.close();
+      const r = new SR();
+      try { r.start(t); try { r.abort(); } catch {} }
+      catch (e) { trackSupport = e.name === 'InvalidStateError'; }
+    } catch (e) { console.warn(e); }
+    return trackSupport;
+  }
+  async function openTabAudio() {
+    if (!supportsTrackInput()) {
+      setStatus('Trình duyệt này chưa hỗ trợ nghe âm thanh tab. Hãy cập nhật Google Chrome trên máy tính, hoặc dùng 🎤 Micro.');
+      return false;
+    }
+    try {
+      tabStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 1 },   // required by the API; kept tiny since we never show it
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        preferCurrentTab: false, selfBrowserSurface: 'exclude', surfaceSwitching: 'include', systemAudio: 'include'
+      });
+    } catch (e) { console.warn(e); setStatus('Đã huỷ chọn tab.'); return false; }
+    const t = tabStream.getAudioTracks()[0];
+    if (!t) {
+      closeTabAudio();
+      setStatus('Tab được chọn không có âm thanh. Bấm Bắt đầu lại, chọn tab và bật “Chia sẻ cả âm thanh của thẻ”.');
+      return false;
+    }
+    t.onended = () => { if (running) { stop(); setStatus('Đã dừng chia sẻ tab.'); } };
+    audioTrack = t;
+    return true;
+  }
+  function closeTabAudio() {
+    if (tabStream) tabStream.getTracks().forEach(t => t.stop());
+    tabStream = null; audioTrack = null;
+  }
+
+  let starting = false;
   async function start() {
-    if (!SR) return;
+    if (!SR || starting) return;
+    prepareLocal();   // inside the click gesture, so the on-device model may download
+    if ($('source').value === 'tab') {
+      starting = true;
+      const ok = await openTabAudio();
+      starting = false;
+      if (!ok) return;
+    }
     if (rec) { const old = rec; rec = null; try { old.abort(); } catch {} }
     running = true; restartCount = 0; networkFails = 0;
     startBtn.textContent = '■ Dừng'; startBtn.classList.add('on');
@@ -293,6 +484,8 @@
     clearTimeout(restartTimer);
     startBtn.textContent = '▶ Bắt đầu'; startBtn.classList.remove('on');
     try { rec && rec.stop(); } catch {}   // stop() (not abort) so the last sentence is still delivered
+    // let the recognizer flush its last result before cutting the tab audio
+    if (tabStream) { const s = tabStream; tabStream = null; audioTrack = null; setTimeout(() => s.getTracks().forEach(t => t.stop()), 1500); }
     try { wakeLock && wakeLock.release(); } catch {} wakeLock = null;
     setStatus('Đã dừng');
   }
@@ -306,9 +499,16 @@
   // ---------- tools ----------
   $('clearBtn').onclick = () => {
     if (running) stop();
-    clearTimeout(interimTimer); interimSeq++;
+    clearTimeout(interimTimer); interimTimer = null; interimSeq++;
     log.innerHTML = ''; interimEl = null;
   };
+  // If the on-device model is already downloaded, create it right away (no gesture needed then).
+  if ('Translator' in self) {
+    const [sl, tl] = localKey().split('|');
+    Translator.availability({ sourceLanguage: sl, targetLanguage: tl })
+      .then(a => { if (a === 'available') prepareLocal(); }).catch(() => {});
+  }
+
   $('copyBtn').onclick = async () => {
     const txt = [...log.querySelectorAll('.seg')].map(s =>
       s.querySelector('.zh').textContent + '\n' + s.querySelector('.en').textContent).join('\n\n');
