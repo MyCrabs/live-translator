@@ -102,6 +102,9 @@
     warns.push('Trình duyệt này không hỗ trợ nhận giọng nói. Hãy mở bằng Google Chrome (Android hoặc máy tính) hoặc Microsoft Edge.');
     startBtn.disabled = true;
   }
+  // Chromium-based browsers other than Chrome expose the API but often have no working speech service.
+  const otherChromium = /Edg\/|OPR\/|coc_coc|YaBrowser|Vivaldi/.test(navigator.userAgent) || !!navigator.brave;
+  if (SR && otherChromium) warns.push('Nên mở bằng Google Chrome: trình duyệt này thường bị lỗi "network" khi nhận giọng nói.');
   if (!window.isSecureContext) warns.push('Cần mở trang qua https:// (hoặc localhost) thì micro mới hoạt động.');
   if (warns.length) { $('warn').style.display = 'block'; $('warn').textContent = warns.join(' '); }
 
@@ -212,7 +215,7 @@
   }
 
   // ---------- speech recognition ----------
-  let rec = null, running = false, wakeLock = null, restartCount = 0, restartTimer = null;
+  let rec = null, running = false, wakeLock = null, restartCount = 0, restartTimer = null, networkFails = 0;
   function setStatus(t, live) { statusText.textContent = t; statusEl.classList.toggle('live', !!live); }
 
   const FATAL = {
@@ -233,6 +236,7 @@
     r.maxAlternatives = 1;
     r.onstart = () => { if (r === rec) setStatus('Đang nghe…', true); };
     r.onresult = ev => {
+      networkFails = 0;
       let interim = '';
       for (let i = ev.resultIndex; i < ev.results.length; i++) {
         const res = ev.results[i];
@@ -244,6 +248,13 @@
     r.onerror = e => {
       if (r !== rec) return;
       if (FATAL[e.error]) { stop(); setStatus(FATAL[e.error]); }
+      else if (e.error === 'network' && ++networkFails >= 3) {
+        // Usually means the browser has no working speech service (Edge, Cốc Cốc, Brave, Opera…)
+        // or a VPN/firewall blocks it — retrying forever won't help.
+        stop();
+        setStatus('Không kết nối được dịch vụ nhận giọng nói. Hãy mở trang bằng Google Chrome ' +
+          '(Edge, Cốc Cốc, Brave, Opera thường bị lỗi này), tắt VPN nếu có, rồi bấm Bắt đầu lại.');
+      }
       else if (e.error !== 'no-speech' && e.error !== 'aborted') {
         errored = true; setStatus('Lỗi: ' + e.error + ' – đang thử lại…');
       }
@@ -271,7 +282,7 @@
   async function start() {
     if (!SR) return;
     if (rec) { const old = rec; rec = null; try { old.abort(); } catch {} }
-    running = true; restartCount = 0;
+    running = true; restartCount = 0; networkFails = 0;
     startBtn.textContent = '■ Dừng'; startBtn.classList.add('on');
     setStatus('Đang khởi động…');
     launch();

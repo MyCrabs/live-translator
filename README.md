@@ -25,6 +25,7 @@
 
 - Cần **kết nối Internet** (nhận giọng nói và dịch đều chạy qua dịch vụ miễn phí của Google).
 - Màn hình được giữ sáng khi đang nghe. Nếu chuyển sang ứng dụng khác, việc nghe có thể bị tạm dừng; quay lại trang là tiếp tục.
+- Nếu báo **"Lỗi: network"**: hãy mở bằng **Google Chrome**. Edge, Cốc Cốc, Brave, Opera thường không có dịch vụ nhận giọng nói hoạt động. Nếu đã dùng Chrome mà vẫn lỗi, hãy tắt VPN/proxy.
 - Nếu không nghe được: bấm biểu tượng ổ khoá cạnh thanh địa chỉ → cho phép **Micro** → tải lại trang.
 - Trên điện thoại Android, Chrome có thể phát tiếng "bíp" mỗi khi phiên nghe tự khởi động lại. Đây là hành vi bình thường của Chrome.
 - Bản dịch máy có thể chưa chính xác với tên riêng hoặc thuật ngữ chuyên ngành.
